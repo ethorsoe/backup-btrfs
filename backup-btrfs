@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+
+#
+# Copyright Emil Karlson 2012, freely distributable
+#
+
+set -u
+set -e
+
+sendLevel=""
+sendTarget=""
+configFile=""
+failLog=""
+compression="xz"
+
+IFS=$'\n'
+shopt -s nullglob
+
+die() {
+	[[ $1 != 0 ]] && echo "Failed:"
+	echo "$2"
+	exit $1
+}
+
+mountpointOf() {
+	local path="$1";
+	if mountpoint "$path" > /dev/null; then
+		printf '%s\n' "$path"
+	else
+		mountpointOf "$(dirname "$path")"
+	fi
+}
+
+getSubgen() {
+	local path="${1%%/}"
+	local rootPath="$(mountpointOf "$path")"
+	local id
+
+	btrfs-gen "$rootPath" | grep -v ^- | while read vals; do
+		id="${vals%%$'\t'*}"
+		if ((id < 256)) && [[ "5" != "$id" ]]; then
+			continue
+		fi
+		printf '%s\t%s/' "$vals" "$rootPath"; btrfs inspect-internal subvolid-resolve "$id" "$rootPath"
+	done | grep "^[0-9]*.[0-9]*.${path}/\?\$" | cut -f 2
+}
+
+runCondition() {
+	local target="$1"
+	local lastSnap="$2"
+
+	if which btrfs-gen > /dev/null 2>&1 && (($(getSubgen "$target") <= $(getSubgen "$lastSnap"))); then
+		echo "Nothing new since last snapshot."
+		return 1
+	fi
+	return 0
+}
+
+case "$compression" in
+	xz)
+		compressor="compressor_xz"
+		;;
+	lzo)
+		compressor="compressor_lzo"
+		;;
+	*)
+		die 1 "unsupported compressor"
+		;;
+esac
+
+compressor_xz() {
+	xz -T 2 -c "$@"
+}
+compressor_lzo() {
+	lzop -c "$@"
+}
+
+getNum() {
+	echo "$1" | sed 's/^.*N\([0-9a-f]\{6\}\)\(-sent\)\?$/0x\1/g'
+}
+
+getSnapshots() {
+	local retval=(snapshot-[0-9][0-9][0-9][0-9]-[0-1][0-9]-[0-3][0-9]T[0-2][0-9].[0-5][0-9].[0-5][0-9]N[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]{,-sent})
+	printf "%s\n" ${retval[*]} | sort -r
+}
+
+delSnapshot() {
+	btrfs subvolume delete "${1}" > /dev/null || \
+		die 1 "btrfs subvolume delete ${1}"
+}
+
+sendSnapshot() {
+	local sendSubvolFull="${@: -1}"
+	local sendImage sendSubvol=$(basename "$sendSubvolFull")
+	local sendSubvolDir=$(dirname "$sendSubvolFull") sendSubvolTmp="$(systemd-escape "${root}/${sendSubvol}@$(hostname)")" sftpPart="${sendTarget##sftp://}"
+	local sftpHost="${sftpPart%%/*}" sftpPath="/${sftpPart#*/}"
+	[[ -v sftpTmpPath ]] || sftpTmpPath="$(dirname ${sftpPath})/tmp"
+	case "${sendTarget}" in
+		/*)
+			btrfs send "$@" | btrfs receive "${sendTarget}" || \
+				die 1 "btrfs subvolume send ${1}"
+			;;
+		sftp://*)
+			sendImage=$(mktemp)
+			if ! [[ -f "/var/cache/backup-btrfs/${sendSubvolTmp}.far.${compression}" ]]; then
+				btrfs send "$@" | $compressor -c > "$sendImage"
+				if [[ "${PIPESTATUS[0]}" != "0" ]]; then
+					rm "$sendImage"
+					die 1 "btrfs subvolume send ${1}"
+				fi
+				mkdir -p "/var/cache/backup-btrfs"
+				mv "$sendImage" "/var/cache/backup-btrfs/${sendSubvolTmp}.far.${compression}.tmp"
+				sync
+				mv "/var/cache/backup-btrfs/${sendSubvolTmp}.far.${compression}.tmp" "/var/cache/backup-btrfs/${sendSubvolTmp}.far.${compression}"
+			fi
+			sftp-upload "/var/cache/backup-btrfs/${sendSubvolTmp}.far.${compression}" "${sftpHost}${sftpPath}/${sendSubvol}.far.${compression}" "${sftpTmpPath}" || \
+				exit 0
+			;;
+		*)
+			echo Invalid send target
+			exit 1
+			;;
+	esac
+}
+
+genmask() {
+	local base x
+	x=$1
+	base=$((2**x - 1))
+	printf "%x" $base
+	for ((i=1; i<$(( 2 ** ( ( 4 - x % 4 ) % 4) )); i++)); do
+		printf "\\|%x" $(( $base + $i * ( $base +1 ) ))
+	done
+}
+
+localSend() {
+	local mask operand parent
+	mask="$(genmask $sendLevel)"
+	operand="$(printf "%s\n" ${snapshots[*]} | grep "\\(${mask}\\)\$" | tail -n 1)"
+	parent="$(printf "%s\n" ${snapshots[*]} | grep '-sent$' | head -n 1)"
+
+	if [[ -n "${operand}" ]]; then
+		[[ -d "${sendTarget}/${operand}" ]] && delSnapshot "${sendTarget}/${operand}"
+		if [[ -n "${parent}" ]]; then
+			sendSnapshot -p "${snapshotPath}/${parent}" "${snapshotPath}/${operand}"
+		else
+			sendSnapshot "${snapshotPath}/${operand}"
+		fi
+		if [[ -n "${failLog}" ]]; then
+			echo "Sent ${operand}, diff: ======" >> "${failLog}"
+			rsync -cvan --delete "${snapshotPath}/${operand}/" "${sendTarget}/${operand}/" >> "${failLog}"
+			echo "End diff ${operand} =========" >> "${failLog}"
+		fi
+		mv "${snapshotPath}/${operand}" "${snapshotPath}/${operand}-sent"
+	fi
+
+}
+
+subvol_cleanup() {
+	local level offset index
+	for ((level=1;level<$nLevels;level++)); do
+		for ((offset=0;offset<$levelSize;offset++)); do
+			index=$((${level}*${levelSize}+${offset}))
+			while true; do
+				snapshots=($(getSnapshots))
+				[[ ${index} -ge ${#snapshots[*]} ]] && return 0
+				thisSnapshot="${snapshots[ ${index} ]}"
+				if (( $(getNum "$thisSnapshot")%2**${level} < 2**${level}-1 )); then
+					delSnapshot "$thisSnapshot"
+				else
+					break 1
+				fi
+			done
+		done
+	done
+
+	snapshots=($(getSnapshots))
+	for (( i = $(( ${nLevels} * ${levelSize} )); i < ${#snapshots[*]}; i++)); do
+		delSnapshot "${snapshots[${i}]}"
+	done
+}
+
+doSnapshot() {
+	local snapshots=($(getSnapshots))
+	local thisNum
+	local thisSnapshot
+
+	if [[ ${#snapshots[*]} -lt 1 ]]; then
+		thisNum=0
+	else
+		thisNum=$(( ($(getNum ${snapshots[0]}) + 1) % 0x1000000 ))
+	fi
+
+	thisSnapshot="${snapshotPath}/snapshot-$(date +%Y-%m-%dT%H.%M.%S)N$(printf %.6x $thisNum)"
+	btrfs "fi" sync "${root}" > /dev/null
+	btrfs subvolume snapshot -r "$root" "${thisSnapshot}" > /dev/null &
+	sleep 0.01
+	btrfs "fi" sync "${root}" > /dev/null
+	wait
+	btrfs "fi" sync "${root}" > /dev/null
+	[[ -d "${thisSnapshot}" ]] || \
+		die 1 "btrfs subvolume snapshot -r $root ${thisSnapshot}"
+}
+
+usage="usage: $0 <number of levels> <level size> <volume root> [snapshot dir]
+usage: $0 <volume root|configfile>"
+
+case $# in
+	1)
+		if [[ "-h" == "$1" ]] || [[ "--help" == "$1" ]]; then
+			die 0 "$usage"
+		elif [[ -r "${1}/.backup-btrfsrc" ]]; then
+			root="$1"
+			configFile="${1}/.backup-btrfsrc"
+		elif [[ -f "${1}" ]]; then
+			configFile="${1}"
+		else
+			die 1 "${0}: '${1}/.backup-btrfsrc' not found and '${1}' is not a configfile"
+		fi
+		. "${configFile}"
+		;;	
+	4)
+		snapshotPath="$4"
+		nLevels="$1"
+		levelSize="$2"
+		root="$3"
+		;;
+	3)
+		nLevels="$1"
+		levelSize="$2"
+		root="$3"
+		snapshotPath="${root}/.snapshots/"
+		;;
+
+	*)
+		die 1 "$usage"
+esac
+
+
+[[ -d "${snapshotPath}" ]] && mkdir -p "${snapshotPath}"
+cd "${snapshotPath}"
+snapshots=($(getSnapshots))
+if ((0 == ${#snapshots[*]})) || runCondition "$root" "${snapshotPath%/}/${snapshots[0]}"; then
+	doSnapshot
+fi
+
+snapshots=($(getSnapshots))
+if [[ ${#snapshots[*]} -gt $(( 2 * ${nLevels} * ${levelSize} )) ]]; then
+	subvol_cleanup
+fi
+
+snapshots=($(getSnapshots))
+if [[ -n "$sendLevel" ]] && [[ -n "$sendTarget" ]] && [[ -n "${configFile}" ]]; then
+	( flock -x -n 3 || exit 0; localSend; ) 3<"${configFile}"
+fi
+
+exit $?
