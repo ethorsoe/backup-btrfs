@@ -1,0 +1,30 @@
+#! /usr/bin/env bash
+
+#
+# Copyright Emil Karlson 2016, freely distributable
+#
+
+set -u
+set -e
+
+if [[ "3" != $# ]]; then
+	echo "usage: $0 <src file> <user@host/path/[filename]> <remote tmp path>"
+	exit 1
+fi
+
+srcFile="$(echo "$1" | sed 's/\\/\\\\/g')"
+sftpLoc="$2"
+sftpTmpLoc="$3"
+sftpHost="${sftpLoc%%/*}" sftpPath="/${sftpLoc#*/}"
+sftpTmpPath="/${sftpTmpLoc#*/}"
+file="${srcFile##*/}"
+
+echo ls | sftp "$sftpHost" > /dev/null 2>&1 || exit 1
+if sftp -b <(printf '%s\n' "cd ${sftpPath}") "$sftpHost" > /dev/null 2>&1; then
+	sftpPath="${sftpPath%/}/${file}"
+fi
+
+sftp -b <(echo "reput ${srcFile} ${sftpTmpPath%/}/${file}") "$sftpHost" 2> /dev/null || \
+	sftp -b <(echo "put ${srcFile} ${sftpTmpPath%/}/${file}") "$sftpHost" || \
+	exit 1
+sftp -b <(echo "rename ${sftpTmpPath%/}/${file} ${sftpPath}" ) "$sftpHost"
