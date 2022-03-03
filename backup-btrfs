@@ -56,18 +56,6 @@ runCondition() {
 	return 0
 }
 
-case "$compression" in
-	xz)
-		compressor="compressor_xz"
-		;;
-	lzo)
-		compressor="lzop"
-		;;
-	*)
-		compressor="$compression"
-		;;
-esac
-
 compressor_xz() {
 	xz -T 2 "$@"
 }
@@ -232,7 +220,17 @@ case $# in
 	*)
 		die 1 "$usage"
 esac
-
+case "$compression" in
+	xz)
+		compressor="compressor_xz"
+		;;
+	lzo)
+		compressor="lzop"
+		;;
+	*)
+		compressor="$compression"
+		;;
+esac
 
 [[ -d "${snapshotPath}" ]] && mkdir -p "${snapshotPath}"
 cd "${snapshotPath}"
