@@ -77,7 +77,8 @@ delSnapshot() {
 sendSnapshot() {
 	local sendSubvolFull="${@: -1}"
 	local sendImage sendSubvol=$(basename "$sendSubvolFull")
-	local sendSubvolDir=$(dirname "$sendSubvolFull") sendSubvolTmp="$(systemd-escape "${root}/${sendSubvol}@$(hostname)")" sftpPart="${sendTarget##sftp://}"
+	local sendSubvolDir=$(dirname "$sendSubvolFull") sftpPart="${sendTarget##sftp://}"
+	local sendSubvolTmp="$(systemd-escape "${root}/${sendSubvol}@$(hostname)" | sed 's/^-//')"
 	local sftpHost="${sftpPart%%/*}" sftpPath="/${sftpPart#*/}"
 	[[ -v sftpTmpPath ]] || sftpTmpPath="$(dirname ${sftpPath})/tmp"
 	case "${sendTarget}" in
