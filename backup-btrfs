@@ -61,18 +61,15 @@ case "$compression" in
 		compressor="compressor_xz"
 		;;
 	lzo)
-		compressor="compressor_lzo"
+		compressor="lzop"
 		;;
 	*)
-		die 1 "unsupported compressor"
+		compressor="$compression"
 		;;
 esac
 
 compressor_xz() {
-	xz -T 2 -c "$@"
-}
-compressor_lzo() {
-	lzop -c "$@"
+	xz -T 2 "$@"
 }
 
 getNum() {
