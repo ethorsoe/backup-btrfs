@@ -6,7 +6,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
-//#include <errno.h>
+#include <errno.h>
+#include <assert.h>
 //#include <btrfs/ioctl.h>
 //#include <btrfs/rbtree.h>
 //#include <btrfs/btrfs-list.h>
@@ -63,6 +64,7 @@ out:
 }
 
 static int get_generation_cb(void *data, struct btrfs_ioctl_search_header *sh, void *private) {
+	(void)private;
 	if (BTRFS_ROOT_ITEM_KEY != sh->type )
 		return 0;
 	assert(sizeof(struct btrfs_root_item) <=sh->len);
