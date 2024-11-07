@@ -83,8 +83,13 @@ sendSnapshot() {
 	[[ -v sftpTmpPath ]] || sftpTmpPath="$(dirname ${sftpPath})/tmp"
 	case "${sendTarget}" in
 		/*)
+			btrfs dev stat -c "${sendTarget}" > /dev/null || \
+				die 1 "$sendTarget has btrfs stat errors"
 			btrfs send "$@" | btrfs receive "${sendTarget}" || \
 				die 1 "btrfs subvolume send ${1}"
+			sync -f "$sendTarget"
+			btrfs dev stat -c "${sendTarget}" > /dev/null || \
+				die 1 "$sendTarget has btrfs stat errors"
 			;;
 		sftp://*)
 			sendImage=$(mktemp)
